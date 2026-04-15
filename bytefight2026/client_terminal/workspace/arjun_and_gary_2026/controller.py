@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from enum import Enum
 import math
-import time
 from typing import Optional, Union
 
 from game import Action, Board, Direction, GameConstants, Location, MoveType, Parity
@@ -11,74 +10,45 @@ from game.board import Hill
 from game.outcome import Result
 
 
-WIN_SCORE = 1_000_000_000.0
-
-
-@dataclass
-class SearchNode:
-    board: Board
-    actions: tuple[Action.Move | Action.Paint, ...]
-    move_count: int
-    moved: bool
-    heuristic: float
+class Mode(Enum):
+    OPENING = 0
+    HILL_RUSH = 1
+    TERRITORY = 2
+    DEFENSE = 3
+    ENDGAME = 4
 
 
 class PlayerController:
     """
-    Search-based controller for ByteFight 2026 Paint.
+    FSM + goal-directed paint bot for ByteFight 2026.
 
-    This is an iteration on the prior bot's approach:
-    - explicit forward simulation
-    - heuristic evaluation
-    - shallow adversarial lookahead
-
-    The main change is that the search now reasons over action sequences in
-    the current Paint ruleset instead of single moves in the older rat game.
+    Key improvements over v1 beam-search bot:
+    - Anti-oscillation via position history tracking
+    - Paint-first strategy (paint every turn when possible)
+    - FSM mode system for strategic coherence
+    - Greedy pathfinding with collision avoidance
+    - Conservative bidding to preserve stamina
     """
 
-    MAX_DEPTH = 5
-    ROOT_BEAM = 14
-    REPLY_BEAM = 8
-    TOP_CANDIDATES = 6
-    MAX_MOVE_ACTIONS = 3
-    MAX_ACTION_OPTIONS = 12
+    HISTORY_SIZE = 20
+    OSCILLATION_PENALTY = 65.0
+    PAINT_STAM_MIN = 25
 
     def __init__(self, player_parity: int, time_left: Callable):
         self.player_parity = player_parity
+        self.pos_history: list[tuple[int, int]] = []
+        self.mode = Mode.OPENING
+        self.turn_count = 0
+
+    # ------------------------------------------------------------------ #
+    #  Public interface                                                    #
+    # ------------------------------------------------------------------ #
 
     def bid(self, board: Board, player_parity: int, time_left: Callable) -> int:
-        deadline = time.perf_counter() + 0.08
-        our_eval, _ = self._search_turn(
-            board=board,
-            turn_parity=player_parity,
-            perspective_parity=player_parity,
-            deadline=deadline,
-            max_depth=3,
-            beam_width=8,
-            return_candidates=False,
-        )
-        opp_eval, _ = self._search_turn(
-            board=board,
-            turn_parity=-player_parity,
-            perspective_parity=player_parity,
-            deadline=deadline + 0.03,
-            max_depth=3,
-            beam_width=8,
-            return_candidates=False,
-        )
-
-        me = board.get_player(player_parity)
-        swing = our_eval - opp_eval
-        hill_count = len(board.hills)
-        bid = 4 + min(6, hill_count)
-        if swing > 0:
-            bid += int(min(12, swing / 14.0))
-
-        nearest_power = self._nearest_powerup_distance(board, player_parity)
-        if nearest_power is not None and nearest_power <= 2:
-            bid += 2
-
-        return max(0, min(int(me.stamina // 3), min(25, bid)))
+        try:
+            return self._bid_inner(board, player_parity)
+        except Exception:
+            return 0
 
     def play(
         self,
@@ -86,537 +56,377 @@ class PlayerController:
         player_parity: int,
         time_left: Callable,
     ) -> Union[Action.Move, Action.Paint, Iterable[Action.Move | Action.Paint]]:
-        budget = self._time_budget(board, time_left)
-        deadline = time.perf_counter() + budget
-
-        _, candidates = self._search_turn(
-            board=board,
-            turn_parity=player_parity,
-            perspective_parity=player_parity,
-            deadline=deadline,
-            max_depth=self.MAX_DEPTH,
-            beam_width=self.ROOT_BEAM,
-            return_candidates=True,
-        )
-
-        if not candidates:
-            return self._fallback_turn(board, player_parity)
-
-        best_actions = candidates[0][1]
-        best_value = -float("inf")
-
-        for our_value, our_actions, our_board in candidates[: self.TOP_CANDIDATES]:
-            if time.perf_counter() >= deadline:
-                break
-
-            if our_board.get_winner() is not None:
-                if our_value > best_value:
-                    best_value = our_value
-                    best_actions = our_actions
-                continue
-
-            reply_deadline = min(deadline, time.perf_counter() + max(0.03, budget * 0.28))
-            reply_value, _ = self._search_turn(
-                board=our_board,
-                turn_parity=-player_parity,
-                perspective_parity=player_parity,
-                deadline=reply_deadline,
-                max_depth=3,
-                beam_width=self.REPLY_BEAM,
-                return_candidates=False,
-            )
-
-            if reply_value > best_value:
-                best_value = reply_value
-                best_actions = our_actions
-
-        if not best_actions:
-            return self._fallback_turn(board, player_parity)
-        if len(best_actions) == 1:
-            return best_actions[0]
-        return list(best_actions)
+        try:
+            return self._play_inner(board, player_parity, time_left)
+        except Exception:
+            return self._emergency_move(board, player_parity)
 
     def commentate(self, board: Board, player_parity: int, time_left: Callable) -> str:
-        return "beam-search paint bot"
-
-    def _time_budget(self, board: Board, time_left: Callable) -> float:
-        try:
-            remaining = max(0.25, float(time_left()))
-        except Exception:
-            remaining = 15.0
-        remaining_rounds = max(1, GameConstants.MAX_ROUNDS - board.current_round)
-        average_slice = remaining / remaining_rounds
-        return min(0.75, max(0.07, 0.7 * average_slice))
-
-    def _search_turn(
-        self,
-        board: Board,
-        turn_parity: int,
-        perspective_parity: int,
-        deadline: float,
-        max_depth: int,
-        beam_width: int,
-        return_candidates: bool,
-    ) -> tuple[float, list[tuple[float, tuple[Action.Move | Action.Paint, ...], Board]]]:
-        initial = SearchNode(
-            board=board.get_copy(),
-            actions=(),
-            move_count=0,
-            moved=False,
-            heuristic=self._evaluate_partial(board, perspective_parity),
-        )
-        frontier = [initial]
-        terminals: list[tuple[float, tuple[Action.Move | Action.Paint, ...], Board]] = []
-
-        for _depth in range(max_depth):
-            if time.perf_counter() >= deadline:
-                break
-
-            next_frontier: list[SearchNode] = []
-            for node in frontier:
-                if time.perf_counter() >= deadline:
-                    break
-
-                if node.moved:
-                    finalized = self._finalize_turn(node.board)
-                    terminals.append(
-                        (
-                            self._evaluate_terminal(finalized, perspective_parity),
-                            node.actions,
-                            finalized,
-                        )
-                    )
-
-                expansions = self._expand_node(
-                    node=node,
-                    turn_parity=turn_parity,
-                    perspective_parity=perspective_parity,
-                    deadline=deadline,
-                )
-                next_frontier.extend(expansions)
-
-            if not next_frontier:
-                break
-
-            next_frontier.sort(
-                key=lambda item: self._search_key(item.heuristic, turn_parity, perspective_parity),
-                reverse=True,
-            )
-            frontier = next_frontier[:beam_width]
-
-        for node in frontier:
-            if node.moved:
-                finalized = self._finalize_turn(node.board)
-                terminals.append(
-                    (
-                        self._evaluate_terminal(finalized, perspective_parity),
-                        node.actions,
-                        finalized,
-                    )
-                )
-
-        if not terminals:
-            fallback = self._fallback_turn(board, turn_parity)
-            fallback_actions = (fallback,) if isinstance(fallback, (Action.Move, Action.Paint)) else tuple(fallback)
-            forecast, ok = board.forecast_turn(turn_parity, list(fallback_actions))
-            if ok:
-                terminals = [
-                    (
-                        self._evaluate_terminal(forecast, perspective_parity),
-                        fallback_actions,
-                        forecast,
-                    )
-                ]
-            else:
-                terminals = [(self._evaluate_terminal(board, perspective_parity), (), board.get_copy())]
-
-        terminals.sort(
-            key=lambda item: self._search_key(item[0], turn_parity, perspective_parity),
-            reverse=True,
-        )
-        best_value = terminals[0][0]
-        return best_value, terminals if return_candidates else []
-
-    def _expand_node(
-        self,
-        node: SearchNode,
-        turn_parity: int,
-        perspective_parity: int,
-        deadline: float,
-    ) -> list[SearchNode]:
-        options = self._enumerate_actions(node.board, turn_parity, node.move_count)
-        if not options:
-            return []
-
-        expansions: list[SearchNode] = []
-        for local_priority, action, next_board in options[: self.MAX_ACTION_OPTIONS]:
-            if time.perf_counter() >= deadline:
-                break
-
-            moved = node.moved or isinstance(action, Action.Move)
-            move_count = node.move_count + (1 if isinstance(action, Action.Move) else 0)
-            heuristic = self._evaluate_partial(next_board, perspective_parity)
-            heuristic += local_priority
-            heuristic -= 0.8 * len(node.actions)
-
-            expansions.append(
-                SearchNode(
-                    board=next_board,
-                    actions=node.actions + (action,),
-                    move_count=move_count,
-                    moved=moved,
-                    heuristic=heuristic,
-                )
-            )
-        return expansions
-
-    def _enumerate_actions(
-        self,
-        board: Board,
-        player_parity: int,
-        move_count: int,
-    ) -> list[tuple[float, Action.Move | Action.Paint, Board]]:
-        player = board.get_player(player_parity)
-        actions: list[tuple[float, Action.Move | Action.Paint, Board]] = []
-
-        for loc in self._adjacent_locations(player.loc):
-            paint = Action.Paint(loc)
-            next_board, ok = board.forecast_action(player_parity, paint)
-            if ok:
-                actions.append((self._action_priority(board, next_board, player_parity, paint), paint, next_board))
-
-        if move_count < self.MAX_MOVE_ACTIONS:
-            for direction in Direction.cardinals():
-                for move_type in (MoveType.REGULAR, MoveType.ERASE):
-                    move = Action.Move(direction=direction, move_type=move_type)
-                    next_board, ok = board.forecast_action(player_parity, move)
-                    if ok:
-                        actions.append((self._action_priority(board, next_board, player_parity, move), move, next_board))
-
-                    beacon_move = Action.Move(
-                        direction=direction,
-                        move_type=move_type,
-                        place_beacon=True,
-                    )
-                    beacon_board, beacon_ok = board.forecast_action(player_parity, beacon_move)
-                    if beacon_ok:
-                        actions.append(
-                            (
-                                self._action_priority(board, beacon_board, player_parity, beacon_move),
-                                beacon_move,
-                                beacon_board,
-                            )
-                        )
-
-            if self._cell(board, player.loc).beacon_parity == player_parity:
-                for target in self._own_beacons(board, player_parity):
-                    move = Action.Move(
-                        direction=None,
-                        move_type=MoveType.BEACON_TRAVEL,
-                        beacon_target=target,
-                    )
-                    next_board, ok = board.forecast_action(player_parity, move)
-                    if ok:
-                        actions.append((self._action_priority(board, next_board, player_parity, move), move, next_board))
-
-        actions.sort(key=lambda item: item[0], reverse=True)
-        return actions
-
-    def _action_priority(
-        self,
-        before: Board,
-        after: Board,
-        player_parity: int,
-        action: Action.Move | Action.Paint,
-    ) -> float:
-        me_before = before.get_player(player_parity)
-        me_after = after.get_player(player_parity)
-        opp_before = before.get_opponent(player_parity)
-        opp_after = after.get_opponent(player_parity)
-
-        priority = 0.0
-        winner = after.get_winner()
-        if winner is not None:
-            result, _ = winner
-            if self._result_for_parity(result, player_parity) > 0:
-                return WIN_SCORE
-
-        priority += 4.0 * (
-            after.get_territory_count(player_parity) - before.get_territory_count(player_parity)
-        )
-        priority -= 1.2 * (me_before.stamina - me_after.stamina)
-        priority += 1.5 * (opp_before.stamina - opp_after.stamina)
-        priority += 24.0 * (
-            len(me_after.controlled_hills) - len(me_before.controlled_hills)
-        )
-        priority -= 18.0 * (
-            len(opp_after.controlled_hills) - len(opp_before.controlled_hills)
+        me = board.get_player(player_parity)
+        return (
+            f"v2 mode={self.mode.name} stam={me.stamina}/{me.max_stamina} "
+            f"terr={board.get_territory_count(player_parity)} "
+            f"hills={len(me.controlled_hills)}"
         )
 
-        if isinstance(action, Action.Paint):
-            cell = self._cell(after, action.location)
-            if cell.hill_id:
-                priority += 10.0
-            if cell.beacon_parity == -player_parity:
-                priority += 6.0
-            priority += 0.8 * abs(cell.paint_value)
-        else:
-            target = me_after.loc
-            target_cell = self._cell(after, target)
-            if target_cell.powerup:
-                priority += 8.0
-            if target_cell.hill_id:
-                priority += 10.0
-            if target == opp_before.loc and self._collision_is_favorable(before, player_parity, target):
-                priority += 120.0
-            if action.move_type == MoveType.ERASE and target_cell.hill_id:
-                priority += 8.0
-            if action.move_type == MoveType.BEACON_TRAVEL:
-                priority += 6.0
-            if action.place_beacon:
-                priority += 12.0
-            priority += self._strategic_cell_bonus(after, player_parity, target)
+    # ------------------------------------------------------------------ #
+    #  Bidding                                                             #
+    # ------------------------------------------------------------------ #
 
-        return priority
-
-    def _evaluate_partial(self, board: Board, perspective_parity: int) -> float:
-        return self._evaluate(board, perspective_parity, include_turn_end=False)
-
-    def _evaluate_terminal(self, board: Board, perspective_parity: int) -> float:
-        return self._evaluate(board, perspective_parity, include_turn_end=True)
-
-    def _evaluate(self, board: Board, perspective_parity: int, include_turn_end: bool) -> float:
-        winner = board.get_winner()
-        if winner is not None:
-            result, _ = winner
-            if result == Result.TIE:
-                return 0.0
-            return WIN_SCORE if self._result_for_parity(result, perspective_parity) > 0 else -WIN_SCORE
-
-        me = board.get_player(perspective_parity)
-        opp = board.get_opponent(perspective_parity)
-
-        territory_diff = board.get_territory_count(perspective_parity) - board.get_territory_count(-perspective_parity)
-        stamina_diff = me.stamina - opp.stamina
-        max_stamina_diff = me.max_stamina - opp.max_stamina
-        hill_control_diff = len(me.controlled_hills) - len(opp.controlled_hills)
-        hill_progress_diff = self._hill_progress(board, perspective_parity) - self._hill_progress(board, -perspective_parity)
-        paint_mass_diff = self._paint_mass(board, perspective_parity) - self._paint_mass(board, -perspective_parity)
-        local_control_diff = self._local_control(board, perspective_parity) - self._local_control(board, -perspective_parity)
-        power_score_diff = self._powerup_score(board, perspective_parity) - self._powerup_score(board, -perspective_parity)
-        beacon_diff = self._beacon_score(board, perspective_parity) - self._beacon_score(board, -perspective_parity)
-        pressure_diff = self._collision_pressure(board, perspective_parity) - self._collision_pressure(board, -perspective_parity)
-
-        score = 0.0
-        score += 85.0 * hill_control_diff
-        score += 9.0 * hill_progress_diff
-        score += 2.4 * stamina_diff
-        score += 1.5 * max_stamina_diff
-        score += 1.8 * territory_diff
-        score += 0.45 * paint_mass_diff
-        score += 0.85 * local_control_diff
-        score += 7.5 * power_score_diff
-        score += 4.0 * beacon_diff
-        score += 12.0 * pressure_diff
-
-        score += 0.4 * self._strategic_cell_bonus(board, perspective_parity, me.loc)
-        score -= 0.25 * self._strategic_cell_bonus(board, -perspective_parity, opp.loc)
-
-        if include_turn_end:
-            score += 0.15 * (board.current_round / max(1, GameConstants.MAX_ROUNDS))
-
-        return score
-
-    def _result_for_parity(self, result: Result, player_parity: int) -> int:
-        if result == Result.TIE:
+    def _bid_inner(self, board: Board, pp: int) -> int:
+        me = board.get_player(pp)
+        if board.current_round < 3:
             return 0
-        if player_parity == 1:
-            return 1 if result == Result.PLAYER_1 else -1
-        return 1 if result == Result.PLAYER_2 else -1
+        cap = max(0, int(me.stamina * 0.04))
+        if len(me.controlled_hills) == 0 and len(board.hills) > 0:
+            return min(3, cap)
+        return min(2, cap)
 
-    def _finalize_turn(self, board: Board) -> Board:
-        finalized = board.get_copy()
-        finalized.end_turn()
-        return finalized
+    # ------------------------------------------------------------------ #
+    #  Core play logic                                                     #
+    # ------------------------------------------------------------------ #
 
-    def _hill_progress(self, board: Board, player_parity: int) -> float:
-        progress = 0.0
+    def _play_inner(
+        self, board: Board, pp: int, time_left: Callable
+    ) -> Union[Action.Move, Action.Paint, Iterable[Action.Move | Action.Paint]]:
+        me = board.get_player(pp)
+
+        # Track position for anti-oscillation
+        self.pos_history.append((me.loc.r, me.loc.c))
+        if len(self.pos_history) > self.HISTORY_SIZE:
+            self.pos_history = self.pos_history[-self.HISTORY_SIZE:]
+        self.turn_count += 1
+
+        # Determine strategy
+        self.mode = self._select_mode(board, pp)
+        target = self._get_target(board, pp)
+
+        # Build validated action sequence
+        actions = self._build_actions(board, pp, target)
+        if actions:
+            return actions if len(actions) > 1 else actions[0]
+
+        # Fallback: try just the best move
+        d = self._best_move_dir(board, pp, target)
+        if d is not None:
+            mv = Action.Move(direction=d)
+            _, ok = board.forecast_turn(pp, [mv])
+            if ok:
+                return mv
+
+        return self._emergency_move(board, pp)
+
+    # ------------------------------------------------------------------ #
+    #  Mode selection                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _select_mode(self, board: Board, pp: int) -> Mode:
+        me = board.get_player(pp)
+        opp = board.get_opponent(pp)
+
+        if self.turn_count <= 2:
+            return Mode.OPENING
+
+        if board.current_round >= 500:
+            return Mode.ENDGAME
+
+        # Defense: opponent near one of our controlled hills
+        for hid in list(me.controlled_hills):
+            hill = board.hills.get(hid)
+            if hill is None:
+                continue
+            for cl in hill.cells:
+                if self._mdist(cl, opp.loc) <= 3:
+                    return Mode.DEFENSE
+
+        # Hill rush: we control nothing
+        if len(me.controlled_hills) == 0 and len(board.hills) > 0:
+            return Mode.HILL_RUSH
+
+        return Mode.TERRITORY
+
+    # ------------------------------------------------------------------ #
+    #  Target selection per mode                                           #
+    # ------------------------------------------------------------------ #
+
+    def _get_target(self, board: Board, pp: int) -> Optional[Location]:
+        if self.mode in (Mode.OPENING, Mode.HILL_RUSH):
+            return self._nearest_needed_hill_cell(board, pp)
+        if self.mode == Mode.DEFENSE:
+            return self._threatened_hill_cell(board, pp)
+        if self.mode == Mode.ENDGAME:
+            return self._nearest_powerup(board, pp) or self._nearest_neutral(board, pp)
+        # TERRITORY
+        return self._territory_target(board, pp)
+
+    def _nearest_needed_hill_cell(self, board: Board, pp: int) -> Optional[Location]:
+        """Nearest hill cell we need to paint (prioritize uncontrolled hills)."""
+        me = board.get_player(pp)
+        best, best_d = None, 999999
         for hill in board.hills.values():
-            my_cells = self._hill_cells_for_parity(hill, player_parity)
-            opp_cells = self._hill_cells_for_parity(hill, -player_parity)
-            required = math.ceil(len(hill.cells) * GameConstants.HILL_CONTROL_THRESHOLD)
-            progress += 0.8 * (my_cells - opp_cells)
-            if my_cells >= required:
-                progress += 3.0
-            if opp_cells >= required:
-                progress -= 3.0
-        return progress
-
-    def _hill_cells_for_parity(self, hill: Hill, player_parity: int) -> int:
-        if player_parity > 0:
-            return hill.control_positive
-        return -hill.control_negative
-
-    def _paint_mass(self, board: Board, player_parity: int) -> int:
-        total = 0
-        for row in board.cells:
-            for cell in row:
-                if cell.owner_parity == player_parity:
-                    total += abs(cell.paint_value)
-        return total
-
-    def _local_control(self, board: Board, player_parity: int) -> int:
-        player = board.get_player(player_parity)
-        count = 0
-        radius = GameConstants.ADJACENCY_RADIUS
-        for dr in range(-radius, radius + 1):
-            for dc in range(-radius, radius + 1):
-                loc = Location(player.loc.r + dr, player.loc.c + dc)
+            bonus = 0 if hill.controller_parity != pp else 10000
+            for loc in hill.cells:
                 if board.oob(loc):
                     continue
-                if self._cell(board, loc).owner_parity == player_parity:
-                    count += 1
-        return count
-
-    def _powerup_score(self, board: Board, player_parity: int) -> float:
-        player = board.get_player(player_parity)
-        score = 0.0
-        for r, row in enumerate(board.cells):
-            for c, cell in enumerate(row):
-                if not cell.powerup:
+                cell = board.cells[loc.r][loc.c]
+                # Skip cells we already own
+                if cell.owner_parity == pp:
                     continue
-                dist = self._grid_distance(board, player.loc, Location(r, c))
-                if dist is None:
-                    continue
-                score += 10.0 / (1.0 + dist)
-        return score
+                d = self._mdist(me.loc, loc) + bonus
+                if d < best_d:
+                    best_d = d
+                    best = loc
+        return best or self._nearest_powerup(board, pp) or self._nearest_neutral(board, pp)
 
-    def _beacon_score(self, board: Board, player_parity: int) -> float:
-        total = 0.0
-        for row in board.cells:
-            for cell in row:
-                if cell.beacon_parity == player_parity:
-                    total += 2.5
-                    if cell.owner_parity == player_parity:
-                        total += 0.5 * abs(cell.paint_value)
-        if self._cell(board, board.get_player(player_parity).loc).beacon_parity == player_parity:
-            total += 2.0
-        return total
-
-    def _collision_pressure(self, board: Board, player_parity: int) -> float:
-        player = board.get_player(player_parity)
-        opponent = board.get_opponent(player_parity)
-        for direction in Direction.cardinals():
-            if player.loc + direction != opponent.loc:
+    def _threatened_hill_cell(self, board: Board, pp: int) -> Optional[Location]:
+        """Our hill cell closest to opponent — go defend it."""
+        opp = board.get_opponent(pp)
+        me = board.get_player(pp)
+        best, best_d = None, 999999
+        for hid in list(me.controlled_hills):
+            hill = board.hills.get(hid)
+            if hill is None:
                 continue
-            if self._collision_is_favorable(board, player_parity, opponent.loc):
-                return 1.0
-            return -1.0
-        return 0.0
+            for loc in hill.cells:
+                d = self._mdist(loc, opp.loc)
+                if d < best_d:
+                    best_d = d
+                    best = loc
+        return best or self._nearest_needed_hill_cell(board, pp)
 
-    def _collision_is_favorable(self, board: Board, player_parity: int, target: Location) -> bool:
-        target_cell = self._cell(board, target)
-        if target_cell.owner_parity == -player_parity:
-            return False
-        return True
+    def _territory_target(self, board: Board, pp: int) -> Optional[Location]:
+        me = board.get_player(pp)
+        # Priority 1: uncontrolled hill cells within reach
+        ht = self._nearest_needed_hill_cell(board, pp)
+        if ht and self._mdist(me.loc, ht) <= 12:
+            return ht
+        # Priority 2: powerup
+        pu = self._nearest_powerup(board, pp)
+        if pu and self._mdist(me.loc, pu) <= 6:
+            return pu
+        # Priority 3: expand paint
+        return self._nearest_neutral(board, pp) or me.loc
 
-    def _strategic_cell_bonus(self, board: Board, player_parity: int, loc: Location) -> float:
-        if board.oob(loc):
-            return -5.0
-        cell = self._cell(board, loc)
-        bonus = 0.0
-        if cell.hill_id:
-            bonus += 8.0
-            hill = board.hills[cell.hill_id]
-            required = math.ceil(len(hill.cells) * GameConstants.HILL_CONTROL_THRESHOLD)
-            my_cells = self._hill_cells_for_parity(hill, player_parity)
-            if my_cells < required:
-                bonus += 4.0
-        if cell.powerup:
-            bonus += 10.0
-        nearest_power = self._nearest_powerup_distance(board, player_parity)
-        if nearest_power is not None:
-            bonus += 3.0 / (1.0 + nearest_power)
-        return bonus
-
-    def _nearest_powerup_distance(self, board: Board, player_parity: int) -> Optional[int]:
-        player = board.get_player(player_parity)
-        best: Optional[int] = None
+    def _nearest_powerup(self, board: Board, pp: int) -> Optional[Location]:
+        me = board.get_player(pp)
+        best, best_d = None, 999999
         for r, row in enumerate(board.cells):
             for c, cell in enumerate(row):
-                if not cell.powerup:
-                    continue
-                dist = self._grid_distance(board, player.loc, Location(r, c))
-                if dist is None:
-                    continue
-                if best is None or dist < best:
-                    best = dist
+                if cell.powerup:
+                    loc = Location(r, c)
+                    d = self._mdist(me.loc, loc)
+                    if d < best_d:
+                        best_d = d
+                        best = loc
         return best
 
-    def _grid_distance(self, board: Board, start: Location, target: Location) -> Optional[int]:
-        if start == target:
-            return 0
-        frontier = [start]
-        visited = {start}
-        depth = 0
-        while frontier and depth < 12:
-            depth += 1
-            next_frontier: list[Location] = []
-            for loc in frontier:
-                for direction in Direction.cardinals():
-                    nxt = loc + direction
-                    if board.oob(nxt):
-                        continue
-                    if nxt in visited:
-                        continue
-                    if self._cell(board, nxt).is_wall:
-                        continue
-                    if nxt == target:
-                        return depth
-                    visited.add(nxt)
-                    next_frontier.append(nxt)
-            frontier = next_frontier
-        return None
-
-    def _adjacent_locations(self, loc: Location) -> tuple[Location, ...]:
-        return tuple(loc + direction for direction in Direction.cardinals())
-
-    def _own_beacons(self, board: Board, player_parity: int) -> list[Location]:
-        beacons: list[Location] = []
+    def _nearest_neutral(self, board: Board, pp: int) -> Optional[Location]:
+        me = board.get_player(pp)
+        best, best_d = None, 999999
         for r, row in enumerate(board.cells):
             for c, cell in enumerate(row):
-                if cell.beacon_parity == player_parity:
-                    beacons.append(Location(r, c))
-        return beacons
+                if cell.is_wall or cell.owner_parity != 0:
+                    continue
+                loc = Location(r, c)
+                d = self._mdist(me.loc, loc)
+                if d < best_d:
+                    best_d = d
+                    best = loc
+        return best
 
-    def _cell(self, board: Board, loc: Location):
-        return board.cells[loc.r][loc.c]
+    # ------------------------------------------------------------------ #
+    #  Action building                                                     #
+    # ------------------------------------------------------------------ #
 
-    def _search_key(self, score: float, turn_parity: int, perspective_parity: int) -> float:
-        return score if turn_parity == perspective_parity else -score
+    def _build_actions(
+        self, board: Board, pp: int, target: Optional[Location]
+    ) -> Optional[list]:
+        me = board.get_player(pp)
+        opp = board.get_opponent(pp)
 
-    def _fallback_turn(self, board: Board, player_parity: int) -> list[Action.Move | Action.Paint]:
-        player = board.get_player(player_parity)
-        paint_targets: list[Location] = []
-        for loc in self._adjacent_locations(player.loc):
+        move_dir = self._best_move_dir(board, pp, target)
+        if move_dir is None:
+            return None
+
+        dest = me.loc + move_dir
+        dest_cell = board.cells[dest.r][dest.c]
+
+        # Decide move type: erase on opponent hill cells if worthwhile
+        use_erase = (
+            dest_cell.owner_parity == -pp
+            and dest_cell.hill_id
+            and me.stamina >= 70
+            and abs(dest_cell.paint_value) >= 2
+        )
+        move_type = MoveType.ERASE if use_erase else MoveType.REGULAR
+        move_action = Action.Move(direction=move_dir, move_type=move_type)
+        move_cost = 40 if use_erase else 0
+
+        # Paint targets: before move (adjacent to current pos) and after (adjacent to dest)
+        pb = self._best_paint(board, pp, me.loc)
+        pa = self._best_paint(board, pp, dest)
+        # Ensure they differ
+        if pa is not None and pb is not None and pa == pb:
+            pa = None
+
+        paint_cost = GameConstants.PAINT_STAMINA_COST  # 15
+
+        # Try progressively simpler action combos
+        combos = []
+        if pb and pa and me.stamina >= paint_cost + move_cost + paint_cost:
+            combos.append([Action.Paint(pb), move_action, Action.Paint(pa)])
+        if pb and me.stamina >= paint_cost + move_cost:
+            combos.append([Action.Paint(pb), move_action])
+        if pa and me.stamina >= move_cost + paint_cost:
+            combos.append([move_action, Action.Paint(pa)])
+        combos.append([move_action])
+
+        for combo in combos:
+            _, ok = board.forecast_turn(pp, combo)
+            if ok:
+                return combo
+        return None
+
+    def _best_paint(
+        self, board: Board, pp: int, from_loc: Location
+    ) -> Optional[Location]:
+        """Best cell to paint from a given location."""
+        best_s, best_l = -1, None
+        for d in Direction.cardinals():
+            loc = from_loc + d
             if board.oob(loc):
                 continue
-            cell = self._cell(board, loc)
+            cell = board.cells[loc.r][loc.c]
             if cell.is_wall:
                 continue
-            if cell.owner_parity in (0, player_parity) and cell.beacon_parity != player_parity:
-                paint_targets.append(loc)
+            if cell.owner_parity == -pp:
+                continue  # Can't paint opponent cells
+            if cell.beacon_parity == pp:
+                continue  # Can't paint on own beacon
 
-        for loc in paint_targets[:2]:
-            action = Action.Paint(loc)
-            forecast, ok = board.forecast_turn(player_parity, [action, Action.Move(Direction.UP)])
+            s = 0
+            if cell.hill_id:
+                hill = board.hills[cell.hill_id]
+                if hill.controller_parity != pp:
+                    s += 100  # Uncontrolled hill — top priority
+                elif abs(cell.paint_value) < GameConstants.MAX_PAINT_VALUE:
+                    s += 12   # Strengthen our hill
+                else:
+                    s += 1
+            if cell.owner_parity == 0:
+                s += 20       # New territory
+            elif cell.owner_parity == pp:
+                if abs(cell.paint_value) < GameConstants.MAX_PAINT_VALUE:
+                    s += 3    # Strengthen existing
+            if cell.beacon_parity == -pp:
+                s += 35       # Destroy opponent beacon
+
+            if s > best_s:
+                best_s = s
+                best_l = loc
+        return best_l if best_s > 0 else None
+
+    # ------------------------------------------------------------------ #
+    #  Move direction scoring                                              #
+    # ------------------------------------------------------------------ #
+
+    def _best_move_dir(
+        self, board: Board, pp: int, target: Optional[Location]
+    ) -> Optional[Direction]:
+        me = board.get_player(pp)
+        opp = board.get_opponent(pp)
+        cands: list[tuple[float, Direction]] = []
+
+        for d in Direction.cardinals():
+            nl = me.loc + d
+            if board.oob(nl):
+                continue
+            cell = board.cells[nl.r][nl.c]
+            if cell.is_wall:
+                continue
+
+            sc = 0.0
+
+            # ---- Goal proximity ----
+            if target is not None:
+                old = self._mdist(me.loc, target)
+                new = self._mdist(nl, target)
+                sc += (old - new) * 12.0
+
+            # ---- Anti-oscillation (CRITICAL) ----
+            pos = (nl.r, nl.c)
+            for i, prev in enumerate(reversed(self.pos_history)):
+                if prev == pos:
+                    w = 1.0 / (1.0 + i * 0.25)
+                    sc -= self.OSCILLATION_PENALTY * w
+
+            # ---- Collision avoidance ----
+            od = self._mdist(nl, opp.loc)
+            if od == 0:
+                # Direct collision
+                if cell.owner_parity == pp:
+                    sc += 80.0   # We win collision on our turf
+                else:
+                    sc -= 250.0  # Deadly on non-friendly ground
+            elif od == 1:
+                if cell.owner_parity != pp:
+                    sc -= 30.0   # Risky adjacency
+
+            # ---- Incentives ----
+            if cell.powerup:
+                sc += 50.0
+            if cell.hill_id:
+                hill = board.hills[cell.hill_id]
+                if hill.controller_parity != pp:
+                    sc += 14.0
+                    if cell.owner_parity == -pp:
+                        sc += 6.0   # Erases opponent paint on entry
+            if cell.owner_parity == 0:
+                sc += 3.0           # Explore neutral
+            elif cell.owner_parity == pp:
+                sc += 0.5           # Safe ground
+
+            # ---- Paintability bonus: prefer moving to spot with good paint targets ----
+            paint_nearby = 0
+            for d2 in Direction.cardinals():
+                adj = nl + d2
+                if board.oob(adj):
+                    continue
+                ac = board.cells[adj.r][adj.c]
+                if ac.is_wall or ac.owner_parity == -pp:
+                    continue
+                if ac.beacon_parity == pp:
+                    continue
+                if ac.hill_id and ac.owner_parity != pp:
+                    paint_nearby += 8
+                elif ac.owner_parity == 0:
+                    paint_nearby += 2
+            sc += paint_nearby * 0.5
+
+            cands.append((sc, d))
+
+        if not cands:
+            return None
+        cands.sort(key=lambda x: x[0], reverse=True)
+        return cands[0][1]
+
+    # ------------------------------------------------------------------ #
+    #  Utilities                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _mdist(self, a: Location, b: Location) -> int:
+        return abs(a.r - b.r) + abs(a.c - b.c)
+
+    def _emergency_move(self, board: Board, pp: int) -> Action.Move:
+        me = board.get_player(pp)
+        for d in Direction.cardinals():
+            nl = me.loc + d
+            if board.oob(nl):
+                continue
+            if board.cells[nl.r][nl.c].is_wall:
+                continue
+            mv = Action.Move(direction=d)
+            _, ok = board.forecast_turn(pp, [mv])
             if ok:
-                return [action, Action.Move(Direction.UP)]
-
-        for direction in Direction.cardinals():
-            move = Action.Move(direction=direction)
-            forecast, ok = board.forecast_turn(player_parity, [move])
-            if ok:
-                return [move]
-
-        return [Action.Move(Direction.UP)]
+                return mv
+        return Action.Move(Direction.UP)
